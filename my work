@@ -1,0 +1,242 @@
+import os
+import cv2
+import itertools
+import numpy as np
+import random
+import time
+from PIL import Image, ImageDraw, ImageOps
+from psd_tools import PSDImage
+
+# Load Haar Cascade for face detection
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+def find_neon_and_black_shapes(template_image_cv):
+    gray = cv2.cvtColor(template_image_cv, cv2.COLOR_BGR2GRAY)
+    _, thresh_black = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY_INV)
+    hsv = cv2.cvtColor(template_image_cv, cv2.COLOR_BGR2HSV)
+    lower_neon_green = np.array([57, 255, 20])
+    upper_neon_green = np.array([57, 255, 20])
+    mask_neon_green = cv2.inRange(hsv, lower_neon_green, upper_neon_green)
+    contours_black, _ = cv2.findContours(thresh_black, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours_neon, _ = cv2.findContours(mask_neon_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return contours_black + contours_neon
+
+def paste_image_into_contour(template, image, contour, faded=False):
+    x, y, w, h = cv2.boundingRect(contour)
+
+    # Resize to ensure the image fully covers the contour area
+    scale = max(w / image.width, h / image.height)
+    new_width = int(image.width * scale)
+    new_height = int(image.height * scale)
+    image_resized = image.resize((new_width, new_height), Image.LANCZOS)
+
+    img_cv_gray = cv2.cvtColor(np.array(image_resized.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    faces = face_cascade.detectMultiScale(img_cv_gray, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30))
+
+    crop_left = max(0, (new_width - w) // 2)
+    crop_top = max(0, (new_height - h) // 2)
+
+    if len(faces) > 0:
+        # Group face-aware crop logic
+        min_x = min(f[0] for f in faces)
+        min_y = min(f[1] for f in faces)
+        max_x = max(f[0] + f[2] for f in faces)
+        max_y = max(f[1] + f[3] for f in faces)
+
+        face_center_x = (min_x + max_x) // 2
+        face_center_y = (min_y + max_y) // 2
+
+        margin_w = int(w * 0.1)
+        margin_h = int(h * 0.1)
+
+        crop_left = max(0, min(face_center_x - w // 2 - margin_w, new_width - w))
+        crop_top = max(0, min(face_center_y - h // 2 - margin_h, new_height - h))
+
+    # Crop image area according to calculated crop box
+    crop_box = (int(crop_left), int(crop_top), int(crop_left + w), int(crop_top + h))
+    fitted_image = image_resized.crop(crop_box)
+
+    # Create mask for contour and apply to image
+    contour_mask = Image.new("L", (w, h), 0)
+    shifted_contour = [(pt[0][0] - x, pt[0][1] - y) for pt in contour]
+    ImageDraw.Draw(contour_mask).polygon(shifted_contour, fill=255)
+    fitted_image.putalpha(contour_mask)
+
+    # Paste with alpha mask on a transparent layer
+    paste_layer = Image.new("RGBA", template.size, (0, 0, 0, 0))
+    paste_layer.paste(fitted_image, (x, y), fitted_image)
+    template.paste(paste_layer, (0, 0), paste_layer)
+
+    return template
+
+
+def get_image_orientation_and_faces(image_path):
+    try:
+        img = Image.open(image_path).convert("RGB")
+        img = ImageOps.exif_transpose(img)
+        width, height = img.size
+        orientation = "portrait" if height > width else "landscape"
+        img_cv_gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
+        faces = face_cascade.detectMultiScale(img_cv_gray, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30))
+        return {
+            "path": image_path,
+            "image": img,
+            "orientation": orientation,
+            "faces": faces,
+            "width": width,
+            "height": height
+        }
+    except Exception as e:
+        print(f"⚠ Error reading {image_path}: {e}")
+        return None
+
+def load_psd_as_image(psd_path):
+    return PSDImage.open(psd_path).composite()
+
+def convert_images_to_pdf(directory):
+    images = [Image.open(os.path.join(directory, f)).convert("RGB")
+              for f in sorted(os.listdir(directory)) if f.lower().endswith(".jpg")]
+    if images:
+        pdf_path = os.path.join(directory, 'output.pdf')
+        images[0].save(pdf_path, save_all=True, append_images=images[1:])
+        print(f"✅ PDF saved: {pdf_path}")
+
+def collect_templates_with_contours(template_root):
+    result = []
+    for root, _, files in os.walk(template_root):
+        for file in sorted(files):
+            path = os.path.join(root, file)
+            if file.lower().endswith('.psd'):
+                try:
+                    pil = load_psd_as_image(path).convert("RGBA")
+                    cv = cv2.cvtColor(np.array(pil), cv2.COLOR_RGBA2BGR)
+                except Exception as e:
+                    print(f"⚠ Error loading PSD {path}: {e}")
+                    continue
+            elif file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                cv = cv2.imread(path)
+                if cv is None:
+                    print(f"⚠ Could not read image {path}")
+                    continue
+                pil = Image.fromarray(cv2.cvtColor(cv, cv2.COLOR_BGR2RGB)).convert("RGBA")
+            else:
+                continue
+
+            contours = find_neon_and_black_shapes(cv)
+            large_contours = [c for c in contours if cv2.boundingRect(c)[2] >= 600 and cv2.boundingRect(c)[3] >= 600]
+            if large_contours:
+                result.append({
+                    "file": file,
+                    "path": path,
+                    "pil": pil,
+                    "cv": cv,
+                    "contours": large_contours
+                })
+    return result
+
+def process_templates_to_fill_images(template_image_pairs, destination_dir):
+    os.makedirs(destination_dir, exist_ok=True)
+    output_counter = 1
+
+    for template_root, image_root in template_image_pairs:
+        for root, _, _ in os.walk(image_root):
+            relative_path = os.path.relpath(root, image_root)
+            img_folder = os.path.join(image_root, relative_path)
+            tpl_folder = os.path.join(template_root, relative_path)
+
+            if not os.path.exists(tpl_folder) or not os.path.exists(img_folder):
+                continue
+
+            images = [f for f in os.listdir(img_folder) if f.lower().endswith(('jpg', 'jpeg', 'png'))]
+            if not images:
+                continue
+
+            all_templates = collect_templates_with_contours(tpl_folder)
+            image_infos = [get_image_orientation_and_faces(os.path.join(img_folder, img)) for img in images]
+            image_infos = [info for info in image_infos if info]
+
+            matched = False
+            for r in range(1, len(all_templates) + 1):
+                for combo in itertools.combinations(all_templates, r):
+                    contours = list(itertools.chain.from_iterable([tpl["contours"] for tpl in combo]))
+                    if len(contours) != len(image_infos):
+                        continue
+
+                    contour_assignments = []
+                    unused_images = image_infos.copy()
+                    for contour in contours:
+                        x, y, w, h = cv2.boundingRect(contour)
+                        contour_orientation = "portrait" if h > w else "landscape"
+
+                        best_fit = None
+                        for img_info in unused_images:
+                            fits_face = all(fw <= w and fh <= h for fx, fy, fw, fh in img_info["faces"]) if len(img_info["faces"]) > 0 else True
+                            orientation_match = img_info["orientation"] == contour_orientation
+
+                            if orientation_match and fits_face:
+                                best_fit = img_info
+                                break
+
+                            if best_fit is None:
+                                best_fit = img_info
+
+                        if best_fit:
+                            contour_assignments.append((contour, best_fit))
+                            unused_images.remove(best_fit)
+
+                    if len(contour_assignments) != len(contours):
+                        continue
+
+                    img_idx = 0
+                    for tpl in combo:
+                        temp_out = tpl["pil"].copy()
+                        for contour in tpl["contours"]:
+                            if img_idx >= len(contour_assignments):
+                                break
+                            contour, img_info = contour_assignments[img_idx]
+                            x, y, w, h = cv2.boundingRect(contour)
+                            cx, cy = x + w // 2, y + h // 2
+                            is_black = np.all(tpl["cv"][cy, cx] < 30)
+                            temp_out = paste_image_into_contour(temp_out, img_info["image"], contour, faded=is_black)
+                            img_idx += 1
+
+                        out = temp_out.convert("RGB").resize((10800, 3600), Image.LANCZOS)
+                        timestamp = int(time.time())
+                        out_path = os.path.join(destination_dir, f"{output_counter}.jpg")
+                        out.save(out_path, "JPEG", quality=100)
+                        print(f"✅ Saved {out_path}")
+                        output_counter += 1
+
+                    matched = True
+                    break
+                if matched:
+                    break
+
+            if not matched:
+                print(f"❌ Cannot match image count with template contours in {relative_path}")
+
+    convert_images_to_pdf(destination_dir)
+
+# Example call with paths
+template_image_pairs = [
+    (r"D:\templ\front", r"D:\Harshul & Sanah groom selection\front\New folder"),
+    (r"D:\templ\home wellcome", r"D:\Harshul & Sanah groom selection\000 home pooja\New folder\New folder"),
+    (r"D:\templ\hotel entry", r"D:\Harshul & Sanah groom selection\00 hotel entry\New folder"),
+    (r"D:\templ\ganesh pooja", r"D:\Harshul & Sanah groom selection\001 ganesh ji puja( vinayak)\New folder"),
+    (r"D:\templ\(01)Haldi\New folder\candid", r"D:\Harshul & Sanah groom selection\02 Haldi\candid\New folder"),
+    (r"D:\templ\(01)Haldi\New folder\traditional", r"D:\Harshul & Sanah groom selection\02 Haldi\New folder"),
+    (r"D:\templ\mehndi candid", r"D:\Harshul & Sanah groom selection\01 mehndi\candid\New folder"),
+    (r"D:\templ\mendi trad", r"D:\Harshul & Sanah groom selection\01 mehndi\New folder"),
+    (r"D:\templ\mehndi pose", r"D:\Harshul & Sanah groom selection\01 mehndi\mehndi pose\New folder"),
+    (r"D:\templ\(03)sangeet", r"D:\Harshul & Sanah groom selection\03 sangeet\New folder"),
+    (r"D:\templ\sangeet cand", r"D:\Harshul & Sanah groom selection\03 sangeet\candid"),
+    (r"D:\templ\(06)barat", r"D:\Harshul & Sanah groom selection\04 Baraat\New folder"),
+    (r"D:\templ\varm", r"D:\Harshul & Sanah groom selection\004 varmala\New folder"),
+    (r"D:\templ\(08)phere", r"D:\Harshul & Sanah groom selection\05 Phere\New folder"),
+    (r"D:\templ\vidai", r"D:\Harshul & Sanah groom selection\06 vidai\New folder"),
+    (r"D:\templ\bride wellcome", r"D:\Harshul & Sanah groom selection\08 bride welcome\New folder")
+]
+
+destination_dir = r"D:\pdf\3"
+
+process_templates_to_fill_images(template_image_pairs, destination_dir)
